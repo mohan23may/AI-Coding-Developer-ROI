@@ -1,8 +1,5 @@
 name: Sync model rates
 
-# Refreshes public/rates.json from the pricing registry every day at 06:00 UTC.
-# Each price change lands as its own commit, giving the app an auditable price
-# history. Manual runs allowed via the Actions tab.
 on:
   schedule:
     - cron: "0 6 * * *"
@@ -11,24 +8,38 @@ on:
 permissions:
   contents: write
 
+# Only one sync runs at a time; a second trigger queues instead of racing.
+concurrency:
+  group: rate-sync
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
       - name: Sync rates
         run: node scripts/sync-rates.mjs
-      - name: Commit if changed
+      - name: Commit and push if changed
         run: |
-          if [[ -n "$(git status --porcelain public/rates.json)" ]]; then
-            git config user.name "rate-sync-bot"
-            git config user.email "actions@github.com"
-            git add public/rates.json
-            git commit -m "chore: sync model rates $(date -u +%Y-%m-%d)"
-            git push
-          else
+          if [[ -z "$(git status --porcelain public/rates.json)" ]]; then
             echo "No rate changes today."
+            exit 0
           fi
+          git config user.name "rate-sync-bot"
+          git config user.email "actions@github.com"
+          git add public/rates.json
+          git commit -m "chore: sync model rates $(date -u +%Y-%m-%d)"
+          # If the remote advanced during this run, rebase on top, then push.
+          # Retry a few times to absorb any concurrent update.
+          for attempt in 1 2 3; do
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" \
+              && git push && { echo "Pushed on attempt $attempt"; exit 0; }
+            echo "Push attempt $attempt failed; retrying in 5s..."
+            sleep 5
+          done
+          echo "Push failed after 3 attempts."
+          exit 1
